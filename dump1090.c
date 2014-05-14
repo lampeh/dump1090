@@ -119,6 +119,8 @@ struct aircraft {
     int even_cprlon;
     double lat, lon;    /* Coordinated obtained from CPR encoded data. */
     long long odd_cprtime, even_cprtime;
+    long distance;
+    int bearing;
     struct aircraft *next; /* Next aircraft in our linked list. */
 };
 
@@ -168,6 +170,7 @@ struct {
     int onlyaddr;                   /* Print only ICAO addresses. */
     int metric;                     /* Use metric units. */
     int aggressive;                 /* Aggressive detection algorithm. */
+    double center_lat, center_lon;  /* Center latitude and longitude for coverage report */
 
     /* Interactive mode */
     struct aircraft *aircrafts;
@@ -185,6 +188,11 @@ struct {
     long long stat_sbs_connections;
     long long stat_out_of_phase;
 } Modes;
+
+struct {
+    long distance;
+    double lat, lon;
+} Coverage[4][360];
 
 /* The struct we use to store information about a decoded message. */
 struct modesMessage {
@@ -274,6 +282,8 @@ void modesInitConfig(void) {
     Modes.interactive_ttl = MODES_INTERACTIVE_TTL;
     Modes.aggressive = 0;
     Modes.interactive_rows = getTermRows();
+    Modes.center_lat = 53.56839;
+    Modes.center_lon = 9.969039;
 }
 
 void modesInit(void) {
@@ -327,6 +337,8 @@ void modesInit(void) {
     Modes.stat_sbs_connections = 0;
     Modes.stat_out_of_phase = 0;
     Modes.exit = 0;
+
+    memset(Coverage, 0, sizeof(Coverage));
 }
 
 /* =============================== RTLSDR handling ========================== */
@@ -1582,6 +1594,8 @@ struct aircraft *interactiveCreateAircraft(uint32_t addr) {
     a->lon = 0;
     a->seen = time(NULL);
     a->messages = 0;
+    a->distance = 0;
+    a->bearing = 0;
     a->next = NULL;
     return a;
 }
@@ -1725,6 +1739,48 @@ void decodeCPR(struct aircraft *a) {
         a->lat = rlat1;
     }
     if (a->lon > 180) a->lon -= 360;
+
+double dlat = (Modes.center_lat - a->lat) * M_PI / 180;
+double dlon = (Modes.center_lon - a->lon) * M_PI / 180;
+double alat1 = Modes.center_lat * M_PI / 180;
+double alat2 = a->lat * M_PI / 180;
+double a1 = sin(dlat/2) * sin(dlat/2) + sin(dlon/2) * sin(dlon/2) * cos(alat1) * cos(alat2);
+double c = 2 * atan2(sqrt(a1), sqrt(1-a1));
+double d = c * 6371;
+long di = round(d);
+a->distance = di;
+
+double y = sin(dlon) * cos(alat2);
+double x = cos(alat1) * sin(alat2) - sin(alat1) * cos(alat2) * cos(dlon);
+double brng = atan2(y, x);
+brng = brng * 180 / M_PI;
+int bi = 360 - (((int)round(brng) + 360) % 360);
+if (bi == 360) {
+       bi = 0;
+}
+a->bearing = bi;
+
+if (di < 500) {
+
+int level = 0;
+if (a->altitude) {
+	if (a->altitude < 1000) {
+		level = 3;
+	} else if (a->altitude < 10000) {
+		level = 2;
+	} else if (a->altitude < 30000) {
+		level = 1;
+	}
+}
+
+if (Coverage[level][bi].distance < di) {
+       Coverage[level][bi].distance = di;
+       Coverage[level][bi].lat = a->lat;
+       Coverage[level][bi].lon = a->lon;
+}
+
+}
+
 }
 
 /* Receive new messages and populate the interactive mode with more info. */
@@ -1807,8 +1863,8 @@ void interactiveShowData(void) {
 
     printf("\x1b[H\x1b[2J");    /* Clear the screen */
     printf(
-"Hex    Flight   Altitude  Speed   Lat       Lon       Track  Messages Seen %s\n"
-"--------------------------------------------------------------------------------\n",
+"Hex    Flight   Altitude  Speed   Lat       Lon       Track  Distance  Bearing  Messages   Seen %s\n"
+"---------------------------------------------------------------------------------------------------\n",
         progress);
 
     while(a && count < Modes.interactive_rows) {
@@ -1820,10 +1876,10 @@ void interactiveShowData(void) {
             speed *= 1.852;
         }
 
-        printf("%-6s %-8s %-9d %-7d %-7.03f   %-7.03f   %-3d   %-9ld %d sec\n",
+        printf("%-6s %-8s %-9d %-7d %-7.03f   %-7.03f   %-3d    %-5ld     %-3d      %-9ld  %d sec\n",
             a->hexaddr, a->flight, altitude, speed,
-            a->lat, a->lon, a->track, a->messages,
-            (int)(now - a->seen));
+            a->lat, a->lon, a->track, a->distance, a->bearing,
+            a->messages, (int)(now - a->seen));
         a = a->next;
         count++;
     }
@@ -1910,7 +1966,7 @@ void modesInitNet(void) {
     Modes.maxfd = -1;
 
     for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
-        int s = anetTcpServer(Modes.aneterr, modesNetServices[j].port, NULL);
+        int s = anetTcpServer(Modes.aneterr, modesNetServices[j].port, (modesNetServices[j].port == 8080)?(NULL):("127.0.0.1"));
         if (s == -1) {
             fprintf(stderr, "Error opening the listening port %d (%s): %s\n",
                 modesNetServices[j].port,
@@ -2133,7 +2189,7 @@ int decodeHexMessage(struct client *c) {
 }
 
 /* Return a description of planes in json. */
-char *aircraftsToJson(int *len) {
+char *aircraftsToJson(long *len) {
     struct aircraft *a = Modes.aircrafts;
     int buflen = 1024; /* The initial buffer is incremented as needed. */
     char *buf = malloc(buflen), *p = buf;
@@ -2150,13 +2206,24 @@ char *aircraftsToJson(int *len) {
             speed *= 1.852;
         }
 
+		time_t age = time(NULL) - a->seen;
+		double age_rel = 0;
+		if (Modes.interactive_ttl) {
+			if (age >= Modes.interactive_ttl) {
+				age_rel = 1;
+			} else {
+				age_rel = (double)age / Modes.interactive_ttl;
+			}
+		}
+
         if (a->lat != 0 && a->lon != 0) {
             l = snprintf(p,buflen,
                 "{\"hex\":\"%s\", \"flight\":\"%s\", \"lat\":%f, "
                 "\"lon\":%f, \"altitude\":%d, \"track\":%d, "
-                "\"speed\":%d},\n",
+                "\"speed\":%d, \"distance\":%ld, \"bearing\":%d, "
+				"\"messages\":%ld, \"age\":%ld, \"age_rel\":%f, \"seen\":%ld},\n",
                 a->hexaddr, a->flight, a->lat, a->lon, a->altitude, a->track,
-                a->speed);
+                a->speed, a->distance, a->bearing, a->messages, age, age_rel, a->seen);
             p += l; buflen -= l;
             /* Resize if needed. */
             if (buflen < 256) {
@@ -2181,6 +2248,57 @@ char *aircraftsToJson(int *len) {
     return buf;
 }
 
+char *coverageToJson(long *len) {
+    int buflen = 1024; /* The initial buffer is incremented as needed. */
+    char *buf = malloc(buflen), *p = buf;
+    int l, i, j;
+
+	l = snprintf(p,buflen,"[\n");
+	p += l; buflen -= l;
+	for (j = 0; j < 4; j++) {
+		l = snprintf(p,buflen,"[\n");
+		p += l; buflen -= l;
+		for (i = 0; i < 360; i++) {
+			l = snprintf(p,buflen,
+/*
+				"{\"bearing\":%d, \"distance\":%ld, \"lat\":%f, \"lon\":%f},\n",
+				i, Coverage[j][i].distance,
+*/
+				"{\"dist\":%ld, \"lat\":%f, \"lon\":%f},\n",
+				Coverage[j][i].distance,
+//				"{\"lat\":%f, \"lon\":%f},\n",
+				(Coverage[j][i].distance)?(Coverage[j][i].lat):(Modes.center_lat),
+				(Coverage[j][i].distance)?(Coverage[j][i].lon):(Modes.center_lon));
+			p += l; buflen -= l;
+			/* Resize if needed. */
+			if (buflen < 256) {
+				int used = p-buf;
+				buflen += 1024; /* Our increment. */
+				buf = realloc(buf,used+buflen);
+				p = buf+used;
+			}
+		}
+		/* Remove the final comma if any, and closes the json array. */
+		if (*(p-2) == ',') {
+			*(p-2) = '\n';
+			p--;
+			buflen++;
+		}
+		l = snprintf(p,buflen,"],\n");
+		p += l; buflen -= l;
+	}
+	/* Remove the final comma if any, and closes the json array. */
+	if (*(p-2) == ',') {
+		*(p-2) = '\n';
+		p--;
+		buflen++;
+	}
+	l = snprintf(p,buflen,"]\n");
+	p += l; buflen -= l;
+    *len = p-buf;
+    return buf;
+}
+
 #define MODES_CONTENT_TYPE_HTML "text/html;charset=utf-8"
 #define MODES_CONTENT_TYPE_JSON "application/json;charset=utf-8"
 
@@ -2192,7 +2310,7 @@ char *aircraftsToJson(int *len) {
  * be closed. */
 int handleHTTPRequest(struct client *c) {
     char hdr[512];
-    int clen, hdrlen;
+    long clen, hdrlen;
     int httpver, keepalive;
     char *p, *url, *content;
     char *ctype;
@@ -2229,6 +2347,9 @@ int handleHTTPRequest(struct client *c) {
     if (strstr(url, "/data.json")) {
         content = aircraftsToJson(&clen);
         ctype = MODES_CONTENT_TYPE_JSON;
+    } else if (strstr(url, "/coverage.json")) {
+        content = coverageToJson(&clen);
+        ctype = MODES_CONTENT_TYPE_JSON;
     } else {
         struct stat sbuf;
         int fd = -1;
@@ -2259,7 +2380,7 @@ int handleHTTPRequest(struct client *c) {
         "Server: Dump1090\r\n"
         "Content-Type: %s\r\n"
         "Connection: %s\r\n"
-        "Content-Length: %d\r\n"
+        "Content-Length: %ld\r\n"
         "\r\n",
         ctype,
         keepalive ? "keep-alive" : "close",
@@ -2272,6 +2393,7 @@ int handleHTTPRequest(struct client *c) {
     if (write(c->fd, hdr, hdrlen) != hdrlen ||
         write(c->fd, content, clen) != clen)
     {
+        fprintf(stderr, "write error\n");
         free(content);
         return 1;
     }
@@ -2438,6 +2560,8 @@ void showHelp(void) {
 "--stats                  With --ifile print stats at exit. No other output.\n"
 "--onlyaddr               Show only ICAO addresses (testing purposes).\n"
 "--metric                 Use metric units (meters, km/h, ...).\n"
+"--center-lat             Center latitude for coverage report.\n"
+"--center-lon             Center longitude for coverage report.\n"
 "--snip <level>           Strip IQ file removing samples < level.\n"
 "--debug <flags>          Debug mode (verbose), see README for details.\n"
 "--help                   Show this help.\n"
@@ -2524,6 +2648,10 @@ int main(int argc, char **argv) {
             Modes.interactive_rows = atoi(argv[++j]);
         } else if (!strcmp(argv[j],"--interactive-ttl")) {
             Modes.interactive_ttl = atoi(argv[++j]);
+        } else if (!strcmp(argv[j],"--center-lat")) {
+            Modes.center_lat = atof(argv[++j]);
+        } else if (!strcmp(argv[j],"--center-lon")) {
+            Modes.center_lon = atof(argv[++j]);
         } else if (!strcmp(argv[j],"--debug") && more) {
             char *f = argv[++j];
             while(*f) {

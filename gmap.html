@@ -2,6 +2,7 @@
 
 <html>
   <head>
+	<title>T-EDDH12 ADS-B receiver</title>
     <meta name="viewport" content="initial-scale=1.0, user-scalable=no" />
     <style type="text/css">
       html { height: 100% }
@@ -39,26 +40,49 @@
     </script>
     <script type="text/javascript">
     Map=null;
-    CenterLat=45.0;
-    CenterLon=9.0;
+    CenterLat=53.56839;
+    CenterLon=9.969039;
     Planes={};
     NumPlanes = 0;
     Selected=null
 
     function getIconForPlane(plane) {
-        var r = 255, g = 255, b = 0;
-        var maxalt = 40000; /* Max altitude in the average case */
-        var invalt = maxalt-plane.altitude;
         var selected = (Selected == plane.hex);
+		var r = 255, g = 255, b = 255;
 
-        if (invalt < 0) invalt = 0;
-        b = parseInt(255/maxalt*invalt);
+		if (plane.altitude <= 10200) {
+			// white -> yellow
+			b = parseInt(255 - (plane.altitude / 40));
+		} else if (plane.altitude <= 20400) {
+			// yellow -> green
+			b = 0;
+			r = parseInt(255 - ((plane.altitude - 10200) / 40));
+		} else if (plane.altitude <= 30600) {
+			// green -> cyan
+			r = 0;
+			b = parseInt((plane.altitude - 20400) / 40);
+		} else if (plane.altitude <= 40800) {
+			// cyan -> blue
+			r = 0;
+			g = parseInt(255 - ((plane.altitude - 30600) / 40));
+		} else {
+			// blue -> red
+			g = 0;
+			var alt = plane.altitude - 40800;
+			if (alt > 5100) {
+				alt = 5100;
+			}
+			b = parseInt(255 - (alt / 20));
+			r = parseInt(alt / 20);
+		}
+
         return {
             strokeWeight: (selected ? 2 : 1),
+            strokeOpacity: 1.0 - (plane.age_rel * 0.5),
             path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
             scale: 5,
             fillColor: 'rgb('+r+','+g+','+b+')',
-            fillOpacity: 0.9,
+            fillOpacity: 0.9 - (plane.age_rel * 0.9),
             rotation: plane.track
         };
     }
@@ -78,7 +102,7 @@
     function refreshGeneralInfo() {
         var i = document.getElementById('geninfo');
 
-        i.innerHTML = NumPlanes+' planes on screen.';
+        i.innerHTML = NumPlanes+' planes on a screen.';
     }
 
     function refreshSelectedInfo() {
@@ -88,21 +112,31 @@
         if (!p) return;
         var html = 'ICAO: '+p.hex+'<br>';
         if (p.flight.length) {
-            html += '<b>'+p.flight+'</b><br>';
+            html += 'Flight: <b><a href="http://www.flightradar24.com/'+p.flight+'">'+p.flight+'</a></b><br>';
         }
-        html += 'Altitude: '+p.altitude+' feet<br>';
-        html += 'Speed: '+p.speed+' knots<br>';
+        html += 'Altitude: '+p.altitude+' feet ('+Math.round(p.altitude/3.2828)+' m)<br>';
+        html += 'Speed: '+p.speed+' knots ('+Math.round(p.speed*1.852)+' km/h)<br>';
         html += 'Coordinates: '+p.lat+', '+p.lon+'<br>';
+		html += 'Messages: '+p.messages+' ('+(Math.round(p.rate*100)/100)+' msgs/s)<br>';
+		html += 'Age: '+p.age+' s<br>';
+		html += 'Distance: '+p.distance+' km<br>';
+		html += 'Bearing: '+p.bearing+'°<br>';
         i.innerHTML = html;
     }
 
     function fetchData() {
         $.getJSON('/data.json', function(data) {
             var stillhere = {}
+			var lasthex = null;
             for (var j=0; j < data.length; j++) {
                 var plane = data[j];
                 var marker = null;
                 stillhere[plane.hex] = true;
+				lasthex = plane.hex;
+				if (!Selected) {
+					Selected = plane.hex;
+				}
+
                 plane.flight = $.trim(plane.flight);
 
                 if (Planes[plane.hex]) {
@@ -118,25 +152,39 @@
                     myplane.lon = plane.lon;
                     myplane.track = plane.track;
                     myplane.flight = plane.flight;
+					myplane.distance = plane.distance;
+					myplane.bearing = plane.bearing;
+					if (plane.seen - myplane.seen > 0) {
+						myplane.rate = (plane.messages - myplane.messages) / (plane.seen - myplane.seen);
+/*
+					} else {
+						myplane.rate = 0;
+*/
+					}
+					myplane.messages = plane.messages;
+					myplane.age = plane.age;
+					myplane.age_rel = plane.age_rel;
+					myplane.seen = plane.seen;
                     if (myplane.hex == Selected)
                         refreshSelectedInfo();
                 } else {
                     marker = new google.maps.Marker({
                         position: new google.maps.LatLng(plane.lat, plane.lon),
                         map: Map,
-                        icon: getIconForPlane(plane)
+                        icon: getIconForPlane(plane),
+						animation: google.maps.Animation.DROP,
                     });
                     plane.marker = marker;
                     marker.planehex = plane.hex;
                     Planes[plane.hex] = plane;
-
                     /* Trap clicks for this marker. */
                     google.maps.event.addListener(marker, 'click', selectPlane);
                 }
-                if (plane.flight.length == 0)
-                    marker.setTitle(plane.hex)
-                else
-                    marker.setTitle(plane.flight+' ('+plane.hex+')')
+                if (plane.flight.length == 0) {
+                    marker.setTitle(plane.hex);
+                } else {
+                    marker.setTitle(plane.flight+' ('+plane.hex+')');
+                }
             }
             NumPlanes = data.length;
 
@@ -144,17 +192,29 @@
             for (var p in Planes) {
                 if (!stillhere[p]) {
                     Planes[p].marker.setMap(null);
+					if (Selected == Planes[p].hex) {
+						if (lasthex) {
+							Selected = lasthex;
+    	                    refreshSelectedInfo();
+						} else {
+							Selected = null;
+							document.getElementById('selinfo').innerHTML = "";
+						}
+					}
                     delete Planes[p];
                 }
             }
         });
     }
 
+	var coverage = [];
+
     function initialize() {
         var mapOptions = {
             center: new google.maps.LatLng(CenterLat, CenterLon),
-            zoom: 5,
-            mapTypeId: google.maps.MapTypeId.ROADMAP
+            zoom: 7,
+            mapTypeId: google.maps.MapTypeId.ROADMAP,
+			streetViewControl: false,
         };
         Map = new google.maps.Map(document.getElementById("map_canvas"), mapOptions);
 
@@ -162,8 +222,53 @@
         window.setInterval(function() {
             fetchData();
             refreshGeneralInfo();
-        }, 1000);
-    }
+        }, 1250);
+
+//		var coverageColor = ['#00FF00', '#00FFFF', '#0000FF', '#FFFF00', '#000000'];
+//		var coverageColor = ['#0000FF', '#00FFFF', '#00FF00', '#FFFF00', '#FFFFFF'];
+//		var coverageColor = ['#FF0000', '#0000FF', '#00FF00', '#FFFF00', '#FFFFFF'];
+		var coverageColor = ['#FF0000', '#0000FF', '#FFFF00', '#FFFFFF'];
+		for (var i = 0; i < 4; i++) {
+			coverage[i] = new google.maps.Polygon({
+				strokeColor: coverageColor[i],
+				strokeOpacity: 0.5,
+				strokeWeight: 1,
+				fillColor: coverageColor[i],
+				fillOpacity: 0.1*(i+1),
+				geodesic: true,
+				clickable: false
+			});
+		}
+
+		var circle = [];
+		for (var i = 0; i < 4; i++) {
+			circle[i] = new google.maps.Circle({
+				center: new google.maps.LatLng(CenterLat, CenterLon),
+				radius: (i+1)*100000,
+				strokeColor: '#000000',
+				strokeOpacity: 0.15,
+				strokeWeight: 2,
+				fillOpacity: 0,
+				clickable: false,
+				map: Map,
+			});
+		}
+
+       (function updateCoverage() {
+           $.getJSON('/coverage.json', function(data) {
+				for (var i = 0; i < 4; i++) {
+					var coveragePath = new Array();
+					for (var j = 0; j < data[i].length; j++) {
+						coveragePath[j] = new google.maps.LatLng(data[i][j].lat, data[i][j].lon);
+					}
+					coverage[i].setPaths(coveragePath);
+					coverage[i].setMap(Map);
+           		}
+			});
+			setTimeout(updateCoverage, 600000);
+//			setTimeout(updateCoverage, 2300);
+		})();
+	}
 
     </script>
   </head>
@@ -173,7 +278,35 @@
       <div>
         <h1>Dump1090</h1>
         <p id="geninfo"></p>
-        <p id="selinfo">Click on a plane for info.</p>
+        <p>Click on a plane for info.</p>
+		<hr />
+		<div>
+		<p>Coverage levels:</p>
+		<p>
+			<input type="checkbox" name="clevels" value="0" checked="checked" onchange="coverage[0].setVisible(!coverage[0].getVisible());" />
+			<span style="background-color: #FF0000">&nbsp;</span> &gt;= 30000 ft
+		</p>
+		<p>
+			<input type="checkbox" name="clevels" value="1" checked="checked" onchange="coverage[1].setVisible(!coverage[1].getVisible());" />
+			<span style="background-color: #0000FF">&nbsp;</span> &lt; 30000 ft
+		</p>
+<!-- 
+		<p>
+			<input type="checkbox" name="clevels" value="2" checked="checked" onchange="coverage[2].setVisible(!coverage[2].getVisible());" />
+			<span style="background-color: #00FF00">&nbsp;</span> &lt; 20000 ft
+		</p>
+-->
+		<p>
+			<input type="checkbox" name="clevels" value="3" checked="checked" onchange="coverage[3].setVisible(!coverage[3].getVisible());" />
+			<span style="background-color: #FFFF00">&nbsp;</span> &lt; 10000 ft
+		</p>
+		<p>
+			<input type="checkbox" name="clevels" value="4" checked="checked" onchange="coverage[4].setVisible(!coverage[4].getVisible());" />
+			<span style="background-color: #FFFFFF">&nbsp;</span> &lt; 1000 ft
+		</p>
+		</div>
+		<hr />
+        <p id="selinfo"></p>
       </div>
     </div>
   </body>
