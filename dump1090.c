@@ -1861,9 +1861,9 @@ void interactiveShowData(void) {
     progress[time(NULL)%3] = '.';
     progress[3] = '\0';
 
-    printf("\x1b[H\x1b[2J");    /* Clear the screen */
+    printf("\x1b[H");    /* Home cursor */
     printf(
-"Hex    Flight   Altitude  Speed   Lat       Lon       Track  Distance  Bearing  Messages   Seen %s\n"
+"Hex    Flight   Altitude  Speed   Lat       Lon       Track  Distance  Bearing  Messages   Seen %s\x1b[0K\n"
 "---------------------------------------------------------------------------------------------------\n",
         progress);
 
@@ -1876,13 +1876,14 @@ void interactiveShowData(void) {
             speed *= 1.852;
         }
 
-        printf("%-6s %-8s %-9d %-7d %-7.03f   %-7.03f   %-3d    %-5ld     %-3d      %-9ld  %d sec\n",
+        printf("%-6s %-8s %-9d %-7d %-7.03f   %-7.03f   %-3d    %-5ld     %-3d      %-9ld  %d sec\x1b[0K\n",
             a->hexaddr, a->flight, altitude, speed,
             a->lat, a->lon, a->track, a->distance, a->bearing,
             a->messages, (int)(now - a->seen));
         a = a->next;
         count++;
     }
+    printf("\x1b[0J");    /* Clear remaining screen */
 }
 
 /* When in interactive mode If we don't receive new nessages within
